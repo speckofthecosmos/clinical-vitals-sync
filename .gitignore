@@ -1,0 +1,10 @@
+# local signing/device config
+.team
+.device
+# generated / build output
+ClinicalVitalsSync.xcodeproj/
+build/
+.build/
+*.xcuserstate
+xcuserdata/
+.DS_Store
