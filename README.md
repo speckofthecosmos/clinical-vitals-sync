@@ -131,3 +131,7 @@ Finding the Team ID without the Xcode GUI: Xcode 16+ keeps profiles under
 
 Add a test in `ClinicalMapperTests` for each new code or unit; the fixtures
 are small inline FHIR JSON strings.
+
+## License
+
+Public domain under [The Unlicense](LICENSE). Take whatever is useful.
