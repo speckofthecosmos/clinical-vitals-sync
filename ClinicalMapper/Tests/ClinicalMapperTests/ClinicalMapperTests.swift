@@ -235,6 +235,24 @@ final class ClinicalMapperTests: XCTestCase {
         XCTAssertEqual(out.skipped.map(\.code), ["PureTone_BUR_01000"])
     }
 
+    func testSpecificLoincWinsOverGenericPanelCodeOnSameObservation() {
+        // Epic lists 8716-3 "Vital signs" before 9279-1 on a respiratory-rate observation.
+        let out = single(#"""
+        {"resourceType":"Observation","id":"rr","status":"final",
+         "code":{"coding":[
+            {"system":"urn:oid:1.2.840.114350.1.13.48.2.7.2.707679","code":"9","display":"Respirations"},
+            {"system":"http://loinc.org","code":"8716-3","display":"Vital signs"},
+            {"system":"http://loinc.org","code":"9279-1","display":"Respiratory rate"}],
+           "text":"Respirations"},
+         "effectiveDateTime":"2023-04-26T13:36:00Z",
+         "valueQuantity":{"value":20,"unit":"/min","code":"/min"}}
+        """#)
+        XCTAssertEqual(out.skipped, [])
+        XCTAssertEqual(out.samples.count, 1)
+        XCTAssertEqual(out.samples[0].metric, .respiratoryRate)
+        XCTAssertEqual(out.samples[0].display, "Respirations")
+    }
+
     func testBatchIsSortedByDate() {
         let later = #"""
         {"resourceType":"Observation","id":"2","status":"final",

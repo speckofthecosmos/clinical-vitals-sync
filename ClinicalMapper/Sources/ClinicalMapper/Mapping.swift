@@ -103,6 +103,16 @@ enum LOINC {
     static let bloodPressurePanels: Set<String> = ["85354-9", "55284-4"]
     static let systolic: Set<String> = ["8480-6"]
     static let diastolic: Set<String> = ["8462-4"]
+
+    /// The code the mapper should act on: the first of the concept's codes that
+    /// means something to us, else its display code.
+    static func resolve(_ concept: FHIRCodeableConcept) -> String {
+        for c in concept.allCodes {
+            if metricByCode[c] != nil || systolic.contains(c) || diastolic.contains(c)
+                || bloodPressurePanels.contains(c) || AudiogramCode.parse(c) != nil { return c }
+        }
+        return concept.preferredCode?.code ?? "?"
+    }
 }
 
 enum UnitConversion {
@@ -160,8 +170,8 @@ public enum ClinicalMapper {
         }
 
         let coding = obs.code.preferredCode
-        let code = coding?.code ?? "?"
-        let display = coding?.display ?? obs.code.text ?? code
+        let code = LOINC.resolve(obs.code)
+        let display = obs.code.text ?? coding?.display ?? code
         let id = obs.id ?? fallbackID
 
         guard let date = obs.effectiveDate else {
@@ -204,9 +214,8 @@ public enum ClinicalMapper {
             consider(code: code, display: display, q: obs.valueQuantity, sourceID: id)
         }
         for c in components {
-            let ccoding = c.code.preferredCode
-            let ccode = ccoding?.code ?? "?"
-            consider(code: ccode, display: ccoding?.display ?? c.code.text ?? ccode, q: c.valueQuantity, sourceID: id + ":" + ccode)
+            let ccode = LOINC.resolve(c.code)
+            consider(code: ccode, display: c.code.text ?? c.code.preferredCode?.display ?? ccode, q: c.valueQuantity, sourceID: id + ":" + ccode)
         }
 
         switch (sys, dia) {

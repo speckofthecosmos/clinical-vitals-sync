@@ -26,6 +26,8 @@ final class SyncEngine: ObservableObject {
     @Published var audiogramsWritten = 0
     @Published var skipped: [SkippedGroup] = []
     @Published var lastError: String?
+    /// Fetch statistics and one raw sample resource per puzzling code, appended to the report.
+    @Published var diagnostics: [String] = []
 
     /// Plain-text version of the result, for the Copy Report button.
     var reportText: String {
@@ -34,6 +36,7 @@ final class SyncEngine: ObservableObject {
         if audiogramsWritten > 0 { lines.append("\(audiogramsWritten)\tAudiogram") }
         lines += ["", "SKIPPED (count\tcode\treason\tdisplay)"]
         for g in skipped { lines.append("\(g.count)\t\(g.code)\t\(g.reason)\t\(g.display)") }
+        lines += ["", "DIAGNOSTICS"] + diagnostics
         return lines.joined(separator: "\n")
     }
 
@@ -65,6 +68,7 @@ final class SyncEngine: ObservableObject {
         written = []
         audiogramsWritten = 0
         skipped = []
+        diagnostics = []
         recordsRead = 0
         defer { isRunning = false }
 
@@ -82,6 +86,7 @@ final class SyncEngine: ObservableObject {
                 }
             }
             recordsRead = batch.count
+            appendRawSamples(batch)
 
             status = "Mapping…"
             let outcome = ClinicalMapper.map(batch: batch)
@@ -119,14 +124,33 @@ final class SyncEngine: ObservableObject {
         var all: [HKClinicalRecord] = []
         var seen = Set<UUID>()
         var predicate: NSPredicate? = nil
+        var pages: [Int] = []
         while true {
             let page = try await fetchPage(of: type, predicate: predicate, limit: pageSize)
             let fresh = page.filter { seen.insert($0.uuid).inserted }
+            pages.append(page.count)
             all += fresh
             guard page.count == pageSize, !fresh.isEmpty, let last = page.last else { break }
             predicate = HKQuery.predicateForSamples(withStart: last.startDate, end: nil, options: [])
         }
+        let f = ISO8601DateFormatter()
+        let range = all.isEmpty ? "none" : "\(f.string(from: all.first!.startDate)) … \(f.string(from: all.last!.startDate))"
+        let versions = Set(all.compactMap { $0.fhirResource?.fhirVersion.stringRepresentation })
+        diagnostics.append("\(type.identifier): \(all.count) records, pages \(pages), dates \(range), FHIR \(versions.sorted())")
         return all
+    }
+
+    /// Report the span of observation dates (effectiveDateTime, not the HealthKit
+    /// startDate, which is only when Health ingested the record).
+    private func appendRawSamples(_ batch: [(json: Data, fallbackID: String)]) {
+        var earliest: String?, latest: String?
+        for item in batch {
+            guard let obj = try? JSONSerialization.jsonObject(with: item.json) as? [String: Any],
+                  let eff = obj["effectiveDateTime"] as? String else { continue }
+            if earliest == nil || eff < earliest! { earliest = eff }
+            if latest == nil || eff > latest! { latest = eff }
+        }
+        diagnostics.append("observation effectiveDateTime span: \(earliest ?? "none") … \(latest ?? "none")")
     }
 
     private func fetchPage(of type: HKClinicalType, predicate: NSPredicate?, limit: Int) async throws -> [HKClinicalRecord] {

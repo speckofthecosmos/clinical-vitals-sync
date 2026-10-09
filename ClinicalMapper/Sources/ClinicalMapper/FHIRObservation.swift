@@ -14,9 +14,20 @@ public struct FHIRCodeableConcept: Decodable, Sendable {
     public var text: String?
 
     /// First LOINC code if present, else the first code of any system.
+    /// Used for display and skip reporting only; mapping tries every coding,
+    /// because Epic lists a generic panel LOINC (8716-3 "Vital signs") ahead
+    /// of the specific one (9279-1 "Respiratory rate") on the same observation.
     var preferredCode: FHIRCoding? {
         guard let coding, !coding.isEmpty else { return nil }
         return coding.first { ($0.system ?? "").contains("loinc") } ?? coding.first
+    }
+
+    /// Every code on the concept, LOINC ones first, in document order.
+    var allCodes: [String] {
+        let all = coding ?? []
+        let loinc = all.filter { ($0.system ?? "").contains("loinc") }
+        let rest = all.filter { !($0.system ?? "").contains("loinc") }
+        return (loinc + rest).compactMap(\.code)
     }
 }
 

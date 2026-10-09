@@ -46,12 +46,42 @@ chart, and apps reading `bodyMass` can't see it.
 - **FHIR version doesn't matter for this.** The Observation fields used
   (`code`, `effectiveDateTime`/`effectivePeriod`, `valueQuantity`,
   `component`) are the same in DSTU2 and R4.
+- **Epic stacks LOINC codes.** A respiratory-rate observation from Kaiser
+  carries `8716-3` "Vital signs" *and* `9279-1` "Respiratory rate" in the same
+  `code.coding` array, panel code first. Taking "the first LOINC" silently
+  drops heart rate, respiratory rate and anything else coded that way. The
+  mapper tries every coding and acts on the first one it knows.
+- **`HKUnit.percent()` is a fraction.** Oxygen saturation of 98 must be
+  written as 0.98 or Health shows 9800 %. The sync version was bumped so a
+  rerun replaced the mis-scaled samples.
+- **Audiograms map.** Epic audiology observations coded
+  `PureTone_AU{L|R}_{hz}` (air conduction, unmasked) become one
+  `HKAudiogramSample` per day under Hearing. Bone-conduction, speech and
+  tympanometry values have no Health type.
+- **A single `HKSampleQuery` with `HKObjectQueryNoLimit` returned 1000
+  records**, which looked like a cap. It wasn't: paging by start date showed
+  201 vitals + 799 labs, both under the page size, and the observation dates
+  matched the real history. The app pages anyway.
+- **The HealthKit `startDate` of a clinical record is when Health ingested
+  it**, not when the observation was taken. Use `effectiveDateTime` from the
+  FHIR resource for anything date-related.
 - **Only values with a Health counterpart can move.** Allergies, conditions,
   immunizations, procedures and notes have no standard Health type; they stay
   as clinical records (where Health already shows them). Most lab analytes
   (A1c, lipids, creatinine…) likewise have no Health type; only glucose does.
   The app lists every skipped code with its display name so the mapping
-  table can be extended when something turns out to be mappable.
+  table can be extended when something turns out to be mappable. On the
+  original Kaiser data set (1000 records, 2023–2026) the final run wrote 216
+  samples across nine types and skipped 770, all of them labs, urinalysis,
+  ECG intervals, stress-test figures, genetics and free-text narratives.
+
+## Reading the report
+
+The Copy Report button puts the run's summary on the clipboard: counts
+written per type, every skipped code with count/reason/display, and a
+diagnostics block (records per clinical type, page sizes, FHIR version,
+observation date span). With Universal Clipboard it lands on the Mac for
+`pbpaste`.
 
 ## Layout
 
