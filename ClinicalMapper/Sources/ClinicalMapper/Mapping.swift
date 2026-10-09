@@ -53,10 +53,38 @@ public struct Skipped: Equatable, Sendable {
     public var reason: String
 }
 
+/// One pure-tone threshold from an audiology observation.
+public struct AudiogramPoint: Equatable, Sendable {
+    public var frequencyHz: Double
+    public var leftDB: Double?
+    public var rightDB: Double?
+}
+
+public struct MappedAudiogram: Equatable, Sendable {
+    public var date: Date
+    public var sourceID: String
+    public var points: [AudiogramPoint]
+}
+
 public struct MappingOutcome: Sendable {
     public var samples: [MappedSample] = []
+    public var audiograms: [MappedAudiogram] = []
     public var skipped: [Skipped] = []
+    /// Raw pure-tone readings; `map(batch:)` folds them into `audiograms`.
+    var audiogramReadings: [(date: Date, ear: Character, hz: Double, dB: Double, sourceID: String)] = []
     public init() {}
+}
+
+/// Epic audiology observation codes look like `PureTone_AUL_04000`
+/// (air conduction, unmasked, left, 4000 Hz). Only air-conduction thresholds
+/// map to Health's audiogram; bone conduction and speech tests are skipped.
+enum AudiogramCode {
+    static func parse(_ code: String) -> (ear: Character, hz: Double)? {
+        let parts = code.split(separator: "_")
+        guard parts.count == 3, parts[0] == "PureTone", parts[1].count == 3, parts[1].hasPrefix("AU"),
+              let ear = parts[1].last, ear == "L" || ear == "R", let hz = Double(parts[2]) else { return nil }
+        return (ear, hz)
+    }
 }
 
 // LOINC → metric. Panels (blood pressure) are handled by component codes.
@@ -136,39 +164,59 @@ public enum ClinicalMapper {
         let display = coding?.display ?? obs.code.text ?? code
         let id = obs.id ?? fallbackID
 
-        func skip(_ reason: String) { out.skipped.append(Skipped(code: code, display: display, reason: reason)) }
+        guard let date = obs.effectiveDate else {
+            out.skipped.append(Skipped(code: code, display: display, reason: "no date")); return out
+        }
 
-        guard let date = obs.effectiveDate else { skip("no date"); return out }
+        var sys: Double?, dia: Double?
 
-        // Blood pressure: panel with components, or a lone systolic/diastolic.
-        if LOINC.bloodPressurePanels.contains(code) || LOINC.systolic.contains(code) || LOINC.diastolic.contains(code) {
-            var sys: Double?, dia: Double?
-            for c in obs.component ?? [] {
-                guard let ccode = c.code.preferredCode?.code, let q = c.valueQuantity, let v = q.value else { continue }
+        // One value (top-level or component) → sample, blood-pressure half, audiogram reading, or skip.
+        func consider(code: String, display: String, q: FHIRQuantity?, sourceID: String) {
+            func skip(_ reason: String) { out.skipped.append(Skipped(code: code, display: display, reason: reason)) }
+            if LOINC.systolic.contains(code) || LOINC.diastolic.contains(code) {
+                guard let q, let v = q.value else { skip("no numeric value"); return }
                 guard let conv = UnitConversion.canonical(v, unit: q.unitToken, for: .bloodPressure) else {
-                    skip("unknown unit \(q.unitToken ?? "nil")"); return out
+                    skip("unknown unit \(q.unitToken ?? "nil")"); return
                 }
-                if LOINC.systolic.contains(ccode) { sys = conv }
-                if LOINC.diastolic.contains(ccode) { dia = conv }
+                if LOINC.systolic.contains(code) { sys = conv } else { dia = conv }
+                return
             }
-            if let q = obs.valueQuantity, let v = q.value, let conv = UnitConversion.canonical(v, unit: q.unitToken, for: .bloodPressure) {
-                if LOINC.systolic.contains(code) { sys = conv }
-                if LOINC.diastolic.contains(code) { dia = conv }
+            if let metric = LOINC.metricByCode[code] {
+                guard let q, let v = q.value else { skip("no numeric value"); return }
+                guard let conv = UnitConversion.canonical(v, unit: q.unitToken, for: metric) else {
+                    skip("unknown unit \(q.unitToken ?? "nil")"); return
+                }
+                out.samples.append(MappedSample(metric: metric, value: conv, secondaryValue: nil, date: date, sourceID: sourceID, display: display))
+                return
             }
-            guard let s = sys, let d = dia else {
-                skip(sys == nil && dia == nil ? "no systolic/diastolic values" : "partial blood pressure (only one of systolic/diastolic)")
-                return out
+            if let tone = AudiogramCode.parse(code) {
+                guard let q, let v = q.value else { skip("no numeric value"); return }
+                out.audiogramReadings.append((date, tone.ear, tone.hz, v, sourceID))
+                return
             }
-            out.samples.append(MappedSample(metric: .bloodPressure, value: s, secondaryValue: d, date: date, sourceID: id, display: display))
-            return out
+            if LOINC.bloodPressurePanels.contains(code) { skip("no systolic/diastolic values"); return }
+            skip("no Health counterpart")
         }
 
-        guard let metric = LOINC.metricByCode[code] else { skip("no Health counterpart"); return out }
-        guard let q = obs.valueQuantity, let v = q.value else { skip("no numeric value"); return out }
-        guard let conv = UnitConversion.canonical(v, unit: q.unitToken, for: metric) else {
-            skip("unknown unit \(q.unitToken ?? "nil")"); return out
+        let components = obs.component ?? []
+        // A panel (components, no value of its own) is only its components.
+        if obs.valueQuantity != nil || components.isEmpty {
+            consider(code: code, display: display, q: obs.valueQuantity, sourceID: id)
         }
-        out.samples.append(MappedSample(metric: metric, value: conv, secondaryValue: nil, date: date, sourceID: id, display: display))
+        for c in components {
+            let ccoding = c.code.preferredCode
+            let ccode = ccoding?.code ?? "?"
+            consider(code: ccode, display: ccoding?.display ?? c.code.text ?? ccode, q: c.valueQuantity, sourceID: id + ":" + ccode)
+        }
+
+        switch (sys, dia) {
+        case let (s?, d?):
+            out.samples.append(MappedSample(metric: .bloodPressure, value: s, secondaryValue: d, date: date, sourceID: id, display: display))
+        case (nil, nil):
+            break
+        default:
+            out.skipped.append(Skipped(code: code, display: display, reason: "partial blood pressure (only one of systolic/diastolic)"))
+        }
         return out
     }
 
@@ -181,6 +229,7 @@ public enum ClinicalMapper {
         for item in batch {
             let one = map(json: item.json, fallbackID: item.fallbackID)
             out.samples += one.samples
+            out.audiogramReadings += one.audiogramReadings
             for s in one.skipped {
                 if s.reason.hasPrefix("partial blood pressure"),
                    let obs = try? JSONDecoder().decode(FHIRObservation.self, from: item.json),
@@ -203,6 +252,23 @@ public enum ClinicalMapper {
         for (_, dia) in loneDia {
             out.skipped.append(Skipped(code: "8462-4", display: dia.2, reason: "partial blood pressure (no systolic at same time)"))
         }
+        // Fold pure-tone readings into one audiogram per calendar day.
+        let cal = Calendar.current
+        let byDay = Dictionary(grouping: out.audiogramReadings) { cal.startOfDay(for: $0.date) }
+        for (_, readings) in byDay {
+            var byHz: [Double: AudiogramPoint] = [:]
+            for r in readings {
+                var p = byHz[r.hz] ?? AudiogramPoint(frequencyHz: r.hz, leftDB: nil, rightDB: nil)
+                if r.ear == "L" { p.leftDB = r.dB } else { p.rightDB = r.dB }
+                byHz[r.hz] = p
+            }
+            let points = byHz.values.sorted { $0.frequencyHz < $1.frequencyHz }
+            let date = readings.map(\.date).min()!
+            let ids = readings.map(\.sourceID).sorted()
+            out.audiograms.append(MappedAudiogram(date: date, sourceID: ids.first! + "+\(ids.count)", points: points))
+        }
+        out.audiogramReadings = []
+        out.audiograms.sort { $0.date < $1.date }
         out.samples.sort { $0.date < $1.date }
         return out
     }

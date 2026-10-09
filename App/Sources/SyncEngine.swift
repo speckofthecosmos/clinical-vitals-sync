@@ -23,8 +23,19 @@ final class SyncEngine: ObservableObject {
     @Published var isRunning = false
     @Published var recordsRead = 0
     @Published var written: [(Metric, Int)] = []
+    @Published var audiogramsWritten = 0
     @Published var skipped: [SkippedGroup] = []
     @Published var lastError: String?
+
+    /// Plain-text version of the result, for the Copy Report button.
+    var reportText: String {
+        var lines = ["Clinical Vitals Sync report", status, "Clinical records read: \(recordsRead)", "", "WRITTEN"]
+        for (m, n) in written { lines.append("\(n)\t\(m.label)") }
+        if audiogramsWritten > 0 { lines.append("\(audiogramsWritten)\tAudiogram") }
+        lines += ["", "SKIPPED (count\tcode\treason\tdisplay)"]
+        for g in skipped { lines.append("\(g.count)\t\(g.code)\t\(g.reason)\t\(g.display)") }
+        return lines.joined(separator: "\n")
+    }
 
     private let store = HKHealthStore()
 
@@ -40,14 +51,19 @@ final class SyncEngine: ObservableObject {
         quantityType(.bodyMass), quantityType(.height), quantityType(.bodyMassIndex),
         quantityType(.heartRate), quantityType(.bloodPressureSystolic), quantityType(.bloodPressureDiastolic),
         quantityType(.bodyTemperature), quantityType(.respiratoryRate), quantityType(.oxygenSaturation),
-        quantityType(.bloodGlucose),
+        quantityType(.bloodGlucose), HKObjectType.audiogramSampleType(),
     ]
+
+    /// Bump whenever the mapping changes shape or scale: HealthKit replaces an
+    /// existing sample with the same sync identifier only if the version is higher.
+    private static let syncVersion = 2
 
     func run() async {
         guard HKHealthStore.isHealthDataAvailable() else { lastError = "Health is not available on this device"; return }
         isRunning = true
         lastError = nil
         written = []
+        audiogramsWritten = 0
         skipped = []
         recordsRead = 0
         defer { isRunning = false }
@@ -70,9 +86,11 @@ final class SyncEngine: ObservableObject {
             status = "Mapping…"
             let outcome = ClinicalMapper.map(batch: batch)
 
-            status = "Writing \(outcome.samples.count) samples…"
-            let objects = outcome.samples.map(Self.healthObject(for:))
+            status = "Writing \(outcome.samples.count + outcome.audiograms.count) samples…"
+            var objects = outcome.samples.map(Self.healthObject(for:))
+            objects += outcome.audiograms.map(Self.audiogram(for:))
             if !objects.isEmpty { try await store.save(objects) }
+            audiogramsWritten = outcome.audiograms.count
 
             var counts: [Metric: Int] = [:]
             for s in outcome.samples { counts[s.metric, default: 0] += 1 }
@@ -86,16 +104,35 @@ final class SyncEngine: ObservableObject {
             }
             skipped = groups.values.sorted { $0.count > $1.count }
 
-            status = "Done: \(outcome.samples.count) written, \(outcome.skipped.count) skipped"
+            status = "Done: \(outcome.samples.count + outcome.audiograms.count) written, \(outcome.skipped.count) skipped"
         } catch {
             lastError = error.localizedDescription
             status = "Failed"
         }
     }
 
+    /// Pages through every record of a clinical type. A single HKSampleQuery
+    /// returned exactly 1000 records on the first run, so page by start date
+    /// and dedupe on UUID (the start-date predicate is inclusive).
     private func fetchClinicalRecords(of type: HKClinicalType) async throws -> [HKClinicalRecord] {
+        let pageSize = 1000
+        var all: [HKClinicalRecord] = []
+        var seen = Set<UUID>()
+        var predicate: NSPredicate? = nil
+        while true {
+            let page = try await fetchPage(of: type, predicate: predicate, limit: pageSize)
+            let fresh = page.filter { seen.insert($0.uuid).inserted }
+            all += fresh
+            guard page.count == pageSize, !fresh.isEmpty, let last = page.last else { break }
+            predicate = HKQuery.predicateForSamples(withStart: last.startDate, end: nil, options: [])
+        }
+        return all
+    }
+
+    private func fetchPage(of type: HKClinicalType, predicate: NSPredicate?, limit: Int) async throws -> [HKClinicalRecord] {
         try await withCheckedThrowingContinuation { cont in
-            let q = HKSampleQuery(sampleType: type, predicate: nil, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { _, samples, error in
+            let sort = [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]
+            let q = HKSampleQuery(sampleType: type, predicate: predicate, limit: limit, sortDescriptors: sort) { _, samples, error in
                 if let error { cont.resume(throwing: error); return }
                 cont.resume(returning: (samples as? [HKClinicalRecord]) ?? [])
             }
@@ -105,7 +142,7 @@ final class SyncEngine: ObservableObject {
 
     private static func metadata(_ id: String) -> [String: Any] {
         [HKMetadataKeySyncIdentifier: "clinical-vitals-sync:" + id,
-         HKMetadataKeySyncVersion: 1]
+         HKMetadataKeySyncVersion: syncVersion]
     }
 
     private static func healthObject(for s: MappedSample) -> HKObject {
@@ -133,10 +170,21 @@ final class SyncEngine: ObservableObject {
             case .bloodGlucose: id = .bloodGlucose
             case .bloodPressure: fatalError("handled above")
             }
-            // oxygenSaturation is stored as a fraction; "%" HKUnit handles the scale.
+            // HKUnit.percent() is a fraction: 0.98, not 98.
+            let value = s.metric == .oxygenSaturation ? s.value / 100 : s.value
             return HKQuantitySample(type: quantityType(id),
-                                    quantity: HKQuantity(unit: unit, doubleValue: s.value),
+                                    quantity: HKQuantity(unit: unit, doubleValue: value),
                                     start: s.date, end: s.date, metadata: metadata(s.sourceID + ":" + s.metric.rawValue))
         }
+    }
+
+    private static func audiogram(for a: MappedAudiogram) -> HKObject {
+        let points = a.points.map { p in
+            try! HKAudiogramSensitivityPoint(
+                frequency: HKQuantity(unit: .hertz(), doubleValue: p.frequencyHz),
+                leftEarSensitivity: p.leftDB.map { HKQuantity(unit: .decibelHearingLevel(), doubleValue: $0) },
+                rightEarSensitivity: p.rightDB.map { HKQuantity(unit: .decibelHearingLevel(), doubleValue: $0) })
+        }
+        return HKAudiogramSample(sensitivityPoints: points, start: a.date, end: a.date, metadata: metadata(a.sourceID + ":audiogram"))
     }
 }

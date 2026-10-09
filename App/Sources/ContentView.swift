@@ -28,13 +28,19 @@ struct ContentView: View {
                 }
 
                 if engine.recordsRead > 0 {
-                    Section("Clinical records read") { Text("\(engine.recordsRead)") }
+                    Section("Clinical records read") {
+                        Text("\(engine.recordsRead)")
+                        Button("Copy report") { UIPasteboard.general.string = engine.reportText }
+                    }
                 }
 
-                if !engine.written.isEmpty {
+                if !engine.written.isEmpty || engine.audiogramsWritten > 0 {
                     Section("Written") {
                         ForEach(engine.written, id: \.0) { metric, count in
                             HStack { Text(metric.label); Spacer(); Text("\(count)").foregroundStyle(.secondary) }
+                        }
+                        if engine.audiogramsWritten > 0 {
+                            HStack { Text("Audiogram"); Spacer(); Text("\(engine.audiogramsWritten)").foregroundStyle(.secondary) }
                         }
                     }
                 }

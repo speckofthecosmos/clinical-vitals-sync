@@ -193,6 +193,48 @@ final class ClinicalMapperTests: XCTestCase {
         XCTAssertEqual(out.skipped, [])
     }
 
+    func testVitalSignsPanelComponentsAreUnpacked() {
+        let out = single(#"""
+        {"resourceType":"Observation","id":"vs","status":"final",
+         "code":{"coding":[{"system":"http://loinc.org","code":"8716-3","display":"Vital signs"}]},
+         "effectiveDateTime":"2025-03-05T10:00:00Z",
+         "component":[
+           {"code":{"coding":[{"system":"http://loinc.org","code":"8867-4","display":"Heart rate"}]},"valueQuantity":{"value":64,"unit":"/min","code":"/min"}},
+           {"code":{"coding":[{"system":"http://loinc.org","code":"9279-1","display":"Resp rate"}]},"valueQuantity":{"value":16,"code":"/min"}},
+           {"code":{"coding":[{"system":"http://loinc.org","code":"39156-5","display":"BMI"}]},"valueQuantity":{"value":24.1,"code":"kg/m2"}},
+           {"code":{"coding":[{"system":"http://loinc.org","code":"8480-6"}]},"valueQuantity":{"value":118,"code":"mm[Hg]"}},
+           {"code":{"coding":[{"system":"http://loinc.org","code":"8462-4"}]},"valueQuantity":{"value":76,"code":"mm[Hg]"}},
+           {"code":{"coding":[{"system":"http://loinc.org","code":"4548-4","display":"A1c"}]},"valueQuantity":{"value":5.4,"code":"%"}}]}
+        """#)
+        XCTAssertEqual(out.samples.map(\.metric), [.heartRate, .respiratoryRate, .bodyMassIndex, .bloodPressure])
+        XCTAssertEqual(out.samples.map(\.sourceID), ["vs:8867-4", "vs:9279-1", "vs:39156-5", "vs"])
+        XCTAssertEqual(out.samples[3].value, 118)
+        XCTAssertEqual(out.samples[3].secondaryValue, 76)
+        XCTAssertEqual(out.skipped, [Skipped(code: "4548-4", display: "A1c", reason: "no Health counterpart")],
+                       "the panel code itself is not reported, only the unmapped component")
+    }
+
+    func testAudiogramReadingsFoldIntoOneSamplePerDay() {
+        func tone(_ code: String, _ v: Double, id: String) -> String { #"""
+        {"resourceType":"Observation","id":"\#(id)","status":"final",
+         "code":{"coding":[{"system":"urn:oid:1.2.3","code":"\#(code)","display":"\#(code)"}]},
+         "effectiveDateTime":"2025-03-05T10:00:00Z",
+         "valueQuantity":{"value":\#(v),"unit":"dB"}}
+        """# }
+        let out = ClinicalMapper.map(batch: [
+            (obs(tone("PureTone_AUL_01000", 15, id: "a")), "a"),
+            (obs(tone("PureTone_AUR_01000", 20, id: "b")), "b"),
+            (obs(tone("PureTone_AUL_04000", 30, id: "c")), "c"),
+            (obs(tone("PureTone_BUR_01000", 10, id: "d")), "d"),   // bone conduction: skipped
+        ])
+        XCTAssertEqual(out.audiograms.count, 1)
+        XCTAssertEqual(out.audiograms[0].points, [
+            AudiogramPoint(frequencyHz: 1000, leftDB: 15, rightDB: 20),
+            AudiogramPoint(frequencyHz: 4000, leftDB: 30, rightDB: nil),
+        ])
+        XCTAssertEqual(out.skipped.map(\.code), ["PureTone_BUR_01000"])
+    }
+
     func testBatchIsSortedByDate() {
         let later = #"""
         {"resourceType":"Observation","id":"2","status":"final",
